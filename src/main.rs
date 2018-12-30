@@ -3,6 +3,7 @@ use std::str::Chars;
 use std::vec;
 
 const MEMSIZE: usize = 300000;
+const DEBUG: bool = false;
 
 enum Op {
     Next,
@@ -59,25 +60,35 @@ impl Op {
 struct Env {
     mem: vec::Vec<u8>,
     addr: usize,
-    insts: vec::Vec<Op>,
-    pc: usize
 }
 
 impl Env {
-    fn new(insts: vec::Vec<Op>, mem_size: usize) -> Env {
-        Env{mem: vec![0; mem_size], addr: 0, insts, pc: 0}
+    fn new(mem_size: usize) -> Env {
+        Env{mem: vec![0; mem_size], addr: 0}
     }
+
     fn dump(&self) {
         println!("addr: {}", self.addr);
-        println!("pc: {}", self.pc);
+        println!();
     }
-    fn run(&mut self) -> Result<(), &str> {
-        let mx = self.insts.len();
-        while self.pc < mx {
-            //self.dump();
-            let pc = self.pc;
-            self.pc += 1;
-            match self.insts[pc] {
+
+    fn run<'a>(&mut self, ops: &mut vec::Vec<Op>, is_global: bool) -> Result<(), &str> {
+        let mx = ops.len();
+        let mut pc = 0usize;
+        loop {
+            if pc >= mx {
+                if !is_global && self.mem[self.addr] != 0 {
+                    pc = 0;
+                    continue;
+                }
+                break;
+            }
+            if DEBUG {
+                self.dump();
+            }
+            let current_pc = pc;
+            pc += 1;
+            match ops[current_pc] {
                 Op::Next => self.addr += 1,
                 Op::Prev => self.addr -= 1,
                 Op::Inc => self.mem[self.addr] += 1,
@@ -92,8 +103,13 @@ impl Env {
                         None => return Err("stdin closed")
                     }
                 },
-                Op::Sub(ref s) => {
-
+                Op::Sub(ref mut s) => {
+                    if self.mem[self.addr] != 0 {
+                        match self.run(&mut s.ops, false) {
+                            Ok(()) => (),
+                            Err(_) => return Err("error")
+                        }
+                    }
                 }
             }
         }
@@ -101,14 +117,13 @@ impl Env {
     }
 }
 
-
 fn main() -> io::Result<()> {
     let mut buffer = String::new();
     io::stdin().read_to_string(&mut buffer)?;
     match Op::parse(&mut buffer.chars(), true) {
-        Ok(ops) => {
-            let mut env = Env::new(ops, MEMSIZE);
-            match env.run() {
+        Ok(mut ops) => {
+            let mut env = Env::new(MEMSIZE);
+            match env.run(&mut ops, true) {
                 Ok(_) => (),
                 Err(s) => println!("{}", s)
             }
