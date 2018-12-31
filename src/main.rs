@@ -1,15 +1,10 @@
+#![feature(asm)]
 use std::io::{self, Read};
 use std::str::Chars;
 use std::vec;
 
 const MEMSIZE: usize = 300000;
 const DEBUG: bool = false;
-
-const inc_rdi: [u8; 3] = [0x48, 0xff, 0xc7];
-const dec_rdi: [u8; 3] = [0x48, 0xff, 0xcf];
-const add_mem: [u8; 2] = [0x00, 0x07];
-const sub_mem: [u8; 2] = [0x28, 0x07];
-
 
 /* JITの構造 
 * Machine Codeモードではcl = 1であることを仮定、現在のメモリ位置をrbxで取ることを仮定
@@ -23,13 +18,13 @@ const sub_mem: [u8; 2] = [0x28, 0x07];
 * [dec]  sub [rbx], cl
 * [out]  call r10
 * [in]   call r11
-* [sub]  j [addr]
+* [sub]  mov rax, <addr>, call rax
 * とでき、さらにSubの前後はprologueとepilogueがあり、
 * prologue:
-*   mov rax, [rbx]; test rax, rax; je [epilogue]
+*   mov rax, [rbx]; test rax, rax; je <epilogue>
 * body:
-*   mov rax, [rbx]; test rax, rax; jne [body]
 *   ...
+*   mov rax, [rbx]; test rax, rax; jne <body>
 * epilogue:
 *   ret 
 * と変換すれば良い。epilogueは、JITから戻る部分で、基本的にcallで読んでいくので、
@@ -42,6 +37,89 @@ extern {
     static bf_write_fun: u64;
 }
 
+
+const inc_rdi: [u8; 3] = [0x48, 0xff, 0xc3];
+const dec_rdi: [u8; 3] = [0x48, 0xff, 0xcb];
+const add_mem: [u8; 2] = [0x00, 0x0b];
+const sub_mem: [u8; 2] = [0x28, 0x0b];
+const out_mem: [u8; 3] = [0x41, 0xff, 0xd2];
+const in_mem:  [u8; 3] = [0x41, 0xff, 0xd3];
+const je:      [u8; 1] = [0xe9]; 
+const jne:     [u8; 2] = [0x0f, 0x85];
+const ret:     [u8; 1] = [0xc3];
+
+fn gen_je(addr: i32) -> [u8; 5] {
+    let addr = (addr - 5) as u32;
+    let b4 : u8 = ((addr >> 24) & 0xff) as u8;
+    let b3 : u8 = ((addr >> 16) & 0xff) as u8;
+    let b2 : u8 = ((addr >> 8) & 0xff) as u8;
+    let b1 : u8 = (addr & 0xff) as u8;
+    [je[0], b1, b2, b3, b4]
+}
+fn gen_jne(addr: i32) -> [u8; 6] {
+    let addr = (addr - 6) as u32;
+    let b4 : u8 = ((addr >> 24) & 0xff) as u8;
+    let b3 : u8 = ((addr >> 16) & 0xff) as u8;
+    let b2 : u8 = ((addr >> 8) & 0xff) as u8;
+    let b1 : u8 = (addr & 0xff) as u8;
+    [jne[0], jne[1], b1, b2, b3, b4]
+}
+
+fn gen_sub(addr: i64) -> [u8; 12] {
+    let addr = addr as u64;
+    let b8 : u8 = ((addr >> 56) & 0xff) as u8;
+    let b7 : u8 = ((addr >> 48) & 0xff) as u8;
+    let b6 : u8 = ((addr >> 40) & 0xff) as u8;
+    let b5 : u8 = ((addr >> 32) & 0xff) as u8;
+    let b4 : u8 = ((addr >> 24) & 0xff) as u8;
+    let b3 : u8 = ((addr >> 16) & 0xff) as u8;
+    let b2 : u8 = ((addr >> 8) & 0xff) as u8;
+    let b1 : u8 = (addr & 0xff) as u8;
+    [0x48, 0xb8, b1, b2, b3, b4, b5, b6, b7, b8, 0xff, 0xd0]
+}
+
+fn gen_prologue(body_size: usize) -> [u8; 11] {
+    let b = gen_je(body_size as i32);
+    // mov rax, [rbx] 48 8b 03
+    // test rax, rax  48 85 c0
+    // je epilogue
+    [0x48, 0x8b, 0x3, 0x48, 0x85, 0xc0, b[0], b[1], b[2], b[3], b[4]]
+}
+fn gen_body_tail(body_size: usize) -> [u8; 12] {
+    let body_size = body_size + 6;
+    let b = gen_jne(-(body_size as i32));
+    // mov rax, [rbx] 48 8b 03
+    // test rax, rax  48 85 c0
+    // jne 
+    [0x48, 0x8b, 0x3, 0x48, 0x85, 0xc0, b[0], b[1], b[2], b[3], b[4], b[5]]
+}
+
+fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
+    let result: usize;
+    unsafe {
+        let addr = mem as *const u8;
+        let memaddr = addr as u64;
+        let addr = memaddr + (ptr as u64);
+        
+        let result_addr: u64;
+        asm!("mov $1, cl\n
+              mov %1, %r10\n
+              mov %2, %r11n
+              mov %3, %rbx\n
+              mov %4, %rax\n
+              call %rax\n
+              mov %rbx, %0" 
+              : "=r"(result_addr)
+              : "r" (bf_read_fun), 
+                "r" (bf_write_fun),
+                "r" (addr),
+                "r" (jit)
+              : "rcx");
+        
+        result = (result_addr - memaddr) as usize;
+    }
+    result
+}
 
 enum Op {
     Next,
@@ -85,8 +163,8 @@ impl Sub {
     // rdiに現在のテープの位置
     fn compile(&self, mut pos: u32) -> Asm {
         let mut asm = Asm::empty();
-        for op in self.ops {
-            asm.push(op.compile(pos);)
+        for op in self.ops.iter() {
+            //asm.push(op.compile(pos);)
         }
         asm
     }
@@ -123,20 +201,27 @@ impl Op {
     }
     fn compile(&self, pos: u32) -> Asm {
         let v = 
-        match self.op {
-            Next => 
-        }
+        match self {
+            Op::Next   => inc_rdi.to_vec(),
+            Op::Prev   => inc_rdi.to_vec(),
+            Op::Inc    => inc_rdi.to_vec(),
+            Op::Dec    => inc_rdi.to_vec(),
+            Op::Out    => inc_rdi.to_vec(),
+            Op::In     => inc_rdi.to_vec(),
+            Op::Sub(s) => inc_rdi.to_vec(),
+        };
+        Asm::new(v)
     }
 }
 
 struct Env {
-    mem: vec::Vec<u8>,
+    mem: [u8; MEMSIZE],
     addr: usize,
 }
 
 impl Env {
     fn new(mem_size: usize) -> Env {
-        Env{mem: vec![0; mem_size], addr: 0}
+        Env{mem: [0; MEMSIZE], addr: 0}
     }
 
     fn dump(&self) {
