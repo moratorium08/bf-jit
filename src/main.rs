@@ -1,10 +1,16 @@
 #![feature(asm)]
+#![feature(libc)]
+extern crate libc;
+use libc::c_void;
 use std::io::{self, Read};
+use std::mem;
 use std::str::Chars;
 use std::vec;
 
 const MEMSIZE: usize = 300000;
 const DEBUG: bool = false;
+const THRESHOLD: u64 = 2;
+const PAGESIZE: usize = 4096;
 
 /* JITの構造 
 * Machine Codeモードではcl = 1であることを仮定、現在のメモリ位置をrbxで取ることを仮定
@@ -31,10 +37,10 @@ const DEBUG: bool = false;
 * ただretすればいい
 */
 
-#[link(name = "bf_lib")]
+#[link(name = "bf", kind="static")]
 extern {
-    static bf_read_fun: u64;
-    static bf_write_fun: u64;
+    fn bf_read_fun();
+    fn bf_write_fun();
 }
 
 
@@ -133,12 +139,13 @@ enum Op {
 
 struct Sub {
     ops: vec::Vec<Op>,
-    count: u32,
-    is_global: bool
+    count: u64,
+    is_global: bool,
+    machine_code: Option<u64>
 }
 
 struct Asm {
-    ops: vec::Vec<u8>
+    pub ops: vec::Vec<u8>
 }
 
 impl Asm {
@@ -153,18 +160,21 @@ impl Asm {
             self.ops.push(op);
         }
     }
+    fn size(&self) -> usize {
+        self.ops.len()
+    }
 }
 
 impl Sub {
     fn new(ops: vec::Vec<Op>, is_global: bool) -> Sub {
-        Sub{ops: ops, count: 0, is_global}
+        Sub{ops: ops, count: 0, is_global, machine_code: None}
     }
 
     // rdiに現在のテープの位置
     fn compile(&self, mut pos: u32) -> Asm {
         let mut asm = Asm::empty();
         for op in self.ops.iter() {
-            //asm.push(op.compile(pos);)
+            asm.push(op.compile(pos));
         }
         asm
     }
@@ -229,9 +239,40 @@ impl Env {
         println!();
     }
 
+    fn page_size(size: usize) -> usize {
+        let x = size % PAGESIZE;
+        if x == 0 {
+            size
+        } else {
+            size + PAGESIZE - (size % PAGESIZE)
+        }
+    }
+
+    fn mmap(&self, asm: Asm) -> u64 {
+        unsafe {
+            let program: *mut u8;
+            let page: *mut c_void = libc::mmap(
+                ::std::ptr::null_mut(),
+                Env::page_size(asm.size()),
+                libc::PROT_EXEC | libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                0,
+                0);
+            program = mem::transmute(page);
+            program.copy_from_nonoverlapping(asm.ops.as_ptr(), asm.size());
+            let ptr: u64 = mem::transmute(page);
+            ptr
+        }
+    }
+
     fn run<'a>(&mut self, sub: &mut Sub, is_global: bool) -> Result<(), &str> {
         let mx = sub.ops.len();
         sub.count += 1;
+        if sub.count > THRESHOLD {
+            let asm = sub.compile(0);
+            let addr = self.mmap(asm);
+            sub.machine_code = Some(addr);
+        }
         let mut pc = 0usize;
         loop {
             if pc >= mx {
