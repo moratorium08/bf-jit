@@ -2,13 +2,15 @@
 #![feature(libc)]
 extern crate libc;
 use libc::c_void;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::mem;
 use std::str::Chars;
 use std::vec;
 
-const MEMSIZE: usize = 300000;
+const MEMSIZE: usize = 600000;
+const INITIAL_MEM_ADDR: usize = 300000;
 const DEBUG: bool = true;
+const USE_JIT: bool = true;
 const THRESHOLD: u64 = 2;
 const PAGESIZE: usize = 4096;
 
@@ -48,8 +50,8 @@ const INC_RDI: [u8; 3] = [0x48, 0xff, 0xc3];
 const DEC_RDI: [u8; 3] = [0x48, 0xff, 0xcb];
 const ADD_MEM: [u8; 2] = [0x00, 0x0b];
 const SUB_MEM: [u8; 2] = [0x28, 0x0b];
-const OUT_MEM: [u8; 3] = [0x41, 0xff, 0xd2];
-const IN_MEM:  [u8; 3] = [0x41, 0xff, 0xd3];
+const IN_MEM:  [u8; 3] = [0x41, 0xff, 0xd2];
+const OUT_MEM: [u8; 3] = [0x41, 0xff, 0xd3];
 const JE:      [u8; 2] = [0x0f, 0x84]; 
 const JNE:     [u8; 2] = [0x0f, 0x85];
 const RET:     [u8; 1] = [0xc3];
@@ -103,6 +105,10 @@ fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
     if DEBUG {
         eprintln!("entering jit code...");
     }
+
+    // before entering jit, flush stdout buffer
+    io::stdout().flush().unwrap_or_else(|_| eprintln!("failed to flush stdout"));
+
     let result: usize;
     unsafe {
         let addr = mem as *const u8;
@@ -150,6 +156,17 @@ fn mmap(asm: Asm) -> u64 {
         let ptr: u64 = mem::transmute(page);
         ptr
     }
+}
+
+fn read_byte<'a>() -> Result<u8, &'a str> {
+    let mut buf: [u8; 1] = [0];
+    unsafe {
+        let buf: *mut c_void = mem::transmute(&mut buf);
+        if libc::read(0, buf, 1) == 0 {
+            return Err("read failed")
+        }
+    }
+    Ok(buf[0])
 }
 
 enum Op {
@@ -220,7 +237,7 @@ impl Sub {
         match self.machine_code {
             Some(_) => (),
             None => {
-                if self.count > THRESHOLD {
+                if USE_JIT && self.count > THRESHOLD {
                     let asm = self.compile();
                     let addr = mmap(asm);
                     self.machine_code = Some(addr);
@@ -252,9 +269,7 @@ impl Op {
                     return Ok(Sub::new(v, is_global));
                 },
                 ' ' | '\n' | '\t' => (),
-                x => {
-                    return Err(format!("{} is invalid character", x));
-                }
+                _ => (),
             }
         }
         Ok(Sub::new(v, is_global))
@@ -289,7 +304,7 @@ struct Env {
 
 impl Env {
     fn new() -> Env {
-        Env{mem: [0; MEMSIZE], addr: 0}
+        Env{mem: [0; MEMSIZE], addr: INITIAL_MEM_ADDR}
     }
 
     fn page_size(size: usize) -> usize {
@@ -301,7 +316,7 @@ impl Env {
         }
     }
 
-    fn run<'a>(&mut self, sub: &mut Sub, is_global: bool) -> Result<(), &str> {
+    fn run(&mut self, sub: &mut Sub, is_global: bool) -> Result<(), &str> {
         let mx = sub.ops.len();
         sub.countup();
         match sub.machine_code {
@@ -327,16 +342,19 @@ impl Env {
             match sub.ops[current_pc] {
                 Op::Next => self.addr += 1,
                 Op::Prev => self.addr -= 1,
-                Op::Inc => self.mem[self.addr] += 1,
-                Op::Dec => self.mem[self.addr] -= 1,
-                Op::Out => print!("{}", self.mem[self.addr] as char),
+                Op::Inc => self.mem[self.addr] = self.mem[self.addr].wrapping_add(1),
+                Op::Dec => self.mem[self.addr] = self.mem[self.addr].wrapping_sub(1),
+                Op::Out => {
+                    let b: &[u8; 1] = &[self.mem[self.addr]];
+                    match io::stdout().write(b) {
+                        Ok(1) => (),
+                        _ => return Err("stdin closed")
+                    }
+                },
                 Op::In => {
-                    match io::stdin().lock().bytes().next() {
-                        Some(c) => match c {
-                            Ok(c) => self.mem[self.addr] = c,
-                            Err(_) => return Err("error: stdin")
-                        }
-                        None => return Err("stdin closed")
+                    match read_byte() {
+                        Ok(x) => self.mem[self.addr] = x,
+                        _ => return Err("stdin closed")
                     }
                 },
                 Op::Sub(ref mut s) => {
