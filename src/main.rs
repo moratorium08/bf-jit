@@ -9,7 +9,7 @@ use std::vec;
 
 const MEMSIZE: usize = 300000;
 const DEBUG: bool = false;
-const THRESHOLD: u64 = 10000000;
+const THRESHOLD: u64 = 2;
 const PAGESIZE: usize = 4096;
 
 /* JITの構造 
@@ -103,8 +103,8 @@ fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
     let result: usize;
     unsafe {
         let addr = mem as *const u8;
-        let memaddr = addr as u64;
-        let memaddr = memaddr + (ptr as u64);
+        let base_memaddr = addr as u64;
+        let memaddr = base_memaddr + (ptr as u64);
 
         let addr = bf_read_fun as *const u8;
         let bf_read_fun_addr = addr as u64;
@@ -128,7 +128,7 @@ fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
               : "rcx", "rbx", "rax", "r10", "r11"
               : "intel");
         
-        result = (result_addr - memaddr) as usize;
+        result = (result_addr - base_memaddr) as usize;
     }
     result
 }
