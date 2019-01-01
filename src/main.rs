@@ -9,7 +9,7 @@ use std::vec;
 
 const MEMSIZE: usize = 300000;
 const DEBUG: bool = false;
-const THRESHOLD: u64 = 2;
+const THRESHOLD: u64 = 10000000;
 const PAGESIZE: usize = 4096;
 
 /* JITの構造 
@@ -27,10 +27,10 @@ const PAGESIZE: usize = 4096;
 * [sub]  mov rax, <addr>, call rax
 * とでき、さらにSubの前後はprologueとepilogueがあり、
 * prologue:
-*   mov rax, [rbx]; test rax, rax; je <epilogue>
+*   mov al, [rbx]; test al, al; je <epilogue>
 * body:
 *   ...
-*   mov rax, [rbx]; test rax, rax; jne <body>
+*   mov al, [rbx]; test al, al; jne <body>
 * epilogue:
 *   ret 
 * と変換すれば良い。epilogueは、JITから戻る部分で、基本的にcallで読んでいくので、
@@ -50,17 +50,17 @@ const ADD_MEM: [u8; 2] = [0x00, 0x0b];
 const SUB_MEM: [u8; 2] = [0x28, 0x0b];
 const OUT_MEM: [u8; 3] = [0x41, 0xff, 0xd2];
 const IN_MEM:  [u8; 3] = [0x41, 0xff, 0xd3];
-const JE:      [u8; 1] = [0xe9]; 
+const JE:      [u8; 2] = [0x0f, 0x84]; 
 const JNE:     [u8; 2] = [0x0f, 0x85];
 const RET:     [u8; 1] = [0xc3];
 
-fn gen_je(addr: i32) -> [u8; 5] {
-    let addr = (addr - 5) as u32;
+fn gen_je(addr: i32) -> [u8; 6] {
+    let addr = (addr - 6) as u32;
     let b4 : u8 = ((addr >> 24) & 0xff) as u8;
     let b3 : u8 = ((addr >> 16) & 0xff) as u8;
     let b2 : u8 = ((addr >> 8) & 0xff) as u8;
     let b1 : u8 = (addr & 0xff) as u8;
-    [JE[0], b1, b2, b3, b4]
+    [JE[0], JE[1], b1, b2, b3, b4]
 }
 fn gen_jne(addr: i32) -> [u8; 6] {
     let addr = (addr - 6) as u32;
@@ -71,8 +71,7 @@ fn gen_jne(addr: i32) -> [u8; 6] {
     [JNE[0], JNE[1], b1, b2, b3, b4]
 }
 
-fn gen_sub(addr: i64) -> [u8; 12] {
-    let addr = addr as u64;
+fn gen_sub(addr: u64) -> [u8; 12] {
     let b8 : u8 = ((addr >> 56) & 0xff) as u8;
     let b7 : u8 = ((addr >> 48) & 0xff) as u8;
     let b6 : u8 = ((addr >> 40) & 0xff) as u8;
@@ -84,20 +83,20 @@ fn gen_sub(addr: i64) -> [u8; 12] {
     [0x48, 0xb8, b1, b2, b3, b4, b5, b6, b7, b8, 0xff, 0xd0]
 }
 
-fn gen_prologue(body_size: usize) -> [u8; 11] {
-    let b = gen_je(body_size as i32);
-    // mov rax, [rbx] 48 8b 03
-    // test rax, rax  48 85 c0
+fn gen_prologue(body_size: usize) -> [u8; 10] {
+    let b = gen_je((body_size + 6) as i32);
+    // mov al, [rbx] 8a 03
+    // test al, al   84 c0
     // je epilogue
-    [0x48, 0x8b, 0x3, 0x48, 0x85, 0xc0, b[0], b[1], b[2], b[3], b[4]]
+    [0x8a, 0x3, 0x84, 0xc0, b[0], b[1], b[2], b[3], b[4], b[5]]
 }
-fn gen_body_tail(body_size: usize) -> [u8; 12] {
+fn gen_body_tail(body_size: usize) -> [u8; 10] {
     let body_size = body_size + 6;
     let b = gen_jne(-(body_size as i32));
-    // mov rax, [rbx] 48 8b 03
-    // test rax, rax  48 85 c0
+    // mov al, [rbx] 8a 03
+    // test al, al   84 c0
     // jne 
-    [0x48, 0x8b, 0x3, 0x48, 0x85, 0xc0, b[0], b[1], b[2], b[3], b[4], b[5]]
+    [0x8a, 0x3, 0x84, 0xc0, b[0], b[1], b[2], b[3], b[4], b[5]]
 }
 
 fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
@@ -177,13 +176,25 @@ impl Sub {
         Sub{ops: ops, count: 0, is_global, machine_code: None}
     }
 
-    // rdiに現在のテープの位置
-    fn compile(&self, mut pos: u32) -> Asm {
-        let mut asm = Asm::empty();
+    fn compile(&self) -> Asm {
+        let mut body = Asm::empty();
         for op in self.ops.iter() {
-            asm.push(op.compile(pos));
+            let asm = op.compile();
+            body.push(asm);
         }
-        asm
+        if self.is_global {
+            body.push(Asm::new(RET.to_vec()));
+            body
+        } else{
+            // body tail
+            body.push(Asm::new(gen_body_tail(body.size()).to_vec()));
+
+            let mut sub = Asm::empty();
+            sub.push(Asm::new(gen_prologue(body.size()).to_vec()));
+            sub.push(body);
+            sub.push(Asm::new(RET.to_vec()));
+            sub 
+        }
     }
 }
 
@@ -216,7 +227,7 @@ impl Op {
         }
         Ok(Sub::new(v, is_global))
     }
-    fn compile(&self, pos: u32) -> Asm {
+    fn compile(&self) -> Asm {
         let v = 
         match self {
             Op::Next   => INC_RDI.to_vec(),
@@ -226,8 +237,13 @@ impl Op {
             Op::Out    => OUT_MEM.to_vec(),
             Op::In     => IN_MEM.to_vec(),
             Op::Sub(s) => {
-                let asm = s.compile(pos);
-                asm.ops
+                match s.machine_code {
+                    Some(addr) => gen_sub(addr).to_vec(),
+                    None => {
+                        let asm = s.compile();
+                        asm.ops
+                    }
+                }
             },
         };
         Asm::new(v)
@@ -240,7 +256,7 @@ struct Env {
 }
 
 impl Env {
-    fn new(mem_size: usize) -> Env {
+    fn new() -> Env {
         Env{mem: [0; MEMSIZE], addr: 0}
     }
 
@@ -279,7 +295,7 @@ impl Env {
         let mx = sub.ops.len();
         sub.count += 1;
         if sub.count > THRESHOLD {
-            let asm = sub.compile(0);
+            let asm = sub.compile();
             let addr = self.mmap(asm);
             sub.machine_code = Some(addr);
         }
@@ -339,7 +355,7 @@ fn main() -> io::Result<()> {
     io::stdin().read_to_string(&mut buffer)?;
     match Op::parse(&mut buffer.chars(), true) {
         Ok(mut ops) => {
-            let mut env = Env::new(MEMSIZE);
+            let mut env = Env::new();
             match env.run(&mut ops, true) {
                 Ok(_) => (),
                 Err(s) => println!("{}", s)
