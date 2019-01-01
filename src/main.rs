@@ -8,7 +8,7 @@ use std::str::Chars;
 use std::vec;
 
 const MEMSIZE: usize = 300000;
-const DEBUG: bool = false;
+const DEBUG: bool = true;
 const THRESHOLD: u64 = 2;
 const PAGESIZE: usize = 4096;
 
@@ -84,14 +84,14 @@ fn gen_sub(addr: u64) -> [u8; 12] {
 }
 
 fn gen_prologue(body_size: usize) -> [u8; 10] {
-    let b = gen_je((body_size + 6) as i32);
+    let b = gen_je((body_size + 4 + 2 /* hmmm bug.. please tell me why */) as i32);
     // mov al, [rbx] 8a 03
     // test al, al   84 c0
     // je epilogue
     [0x8a, 0x3, 0x84, 0xc0, b[0], b[1], b[2], b[3], b[4], b[5]]
 }
 fn gen_body_tail(body_size: usize) -> [u8; 10] {
-    let body_size = body_size + 6;
+    let body_size = body_size + 4;
     let b = gen_jne(-(body_size as i32));
     // mov al, [rbx] 8a 03
     // test al, al   84 c0
@@ -100,6 +100,9 @@ fn gen_body_tail(body_size: usize) -> [u8; 10] {
 }
 
 fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
+    if DEBUG {
+        eprintln!("entering jit code...");
+    }
     let result: usize;
     unsafe {
         let addr = mem as *const u8;
@@ -131,6 +134,22 @@ fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
         result = (result_addr - base_memaddr) as usize;
     }
     result
+}
+fn mmap(asm: Asm) -> u64 {
+    unsafe {
+        let program: *mut u8;
+        let page: *mut c_void = libc::mmap(
+            ::std::ptr::null_mut(),
+            Env::page_size(asm.size()),
+            libc::PROT_EXEC | libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+            0,
+            0);
+        program = mem::transmute(page);
+        program.copy_from_nonoverlapping(asm.ops.as_ptr(), asm.size());
+        let ptr: u64 = mem::transmute(page);
+        ptr
+    }
 }
 
 enum Op {
@@ -194,6 +213,19 @@ impl Sub {
             sub.push(body);
             sub.push(Asm::new(RET.to_vec()));
             sub 
+        }
+    }
+    fn countup(&mut self) {
+        self.count += 1;
+        match self.machine_code {
+            Some(_) => (),
+            None => {
+                if self.count > THRESHOLD {
+                    let asm = self.compile();
+                    let addr = mmap(asm);
+                    self.machine_code = Some(addr);
+                }
+            }
         }
     }
 }
@@ -260,11 +292,6 @@ impl Env {
         Env{mem: [0; MEMSIZE], addr: 0}
     }
 
-    fn dump(&self) {
-        println!("addr: {}", self.addr);
-        println!();
-    }
-
     fn page_size(size: usize) -> usize {
         let x = size % PAGESIZE;
         if x == 0 {
@@ -274,31 +301,9 @@ impl Env {
         }
     }
 
-    fn mmap(&self, asm: Asm) -> u64 {
-        unsafe {
-            let program: *mut u8;
-            let page: *mut c_void = libc::mmap(
-                ::std::ptr::null_mut(),
-                Env::page_size(asm.size()),
-                libc::PROT_EXEC | libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                0,
-                0);
-            program = mem::transmute(page);
-            program.copy_from_nonoverlapping(asm.ops.as_ptr(), asm.size());
-            let ptr: u64 = mem::transmute(page);
-            ptr
-        }
-    }
-
     fn run<'a>(&mut self, sub: &mut Sub, is_global: bool) -> Result<(), &str> {
         let mx = sub.ops.len();
-        sub.count += 1;
-        if sub.count > THRESHOLD {
-            let asm = sub.compile();
-            let addr = self.mmap(asm);
-            sub.machine_code = Some(addr);
-        }
+        sub.countup();
         match sub.machine_code {
             Some(addr) => {
                 self.addr = enter_jit(&self.mem, self.addr, addr);
@@ -310,13 +315,12 @@ impl Env {
         loop {
             if pc >= mx {
                 if !is_global && self.mem[self.addr] != 0 {
-                    pc = 0;
-                    continue;
+                    match self.run(sub, false) {
+                        Ok(()) => (),
+                        Err(_) => return Err("error")
+                    }
                 }
                 break;
-            }
-            if DEBUG {
-                self.dump();
             }
             let current_pc = pc;
             pc += 1;
@@ -336,7 +340,6 @@ impl Env {
                     }
                 },
                 Op::Sub(ref mut s) => {
-                    s.count += 1;
                     if self.mem[self.addr] != 0 {
                         match self.run(s, false) {
                             Ok(()) => (),
