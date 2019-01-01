@@ -39,20 +39,20 @@ const PAGESIZE: usize = 4096;
 
 #[link(name = "bf", kind="static")]
 extern {
-    fn bf_read_fun();
-    fn bf_write_fun();
+    fn bf_read_fun ();
+    fn bf_write_fun ();
 }
 
 
-const inc_rdi: [u8; 3] = [0x48, 0xff, 0xc3];
-const dec_rdi: [u8; 3] = [0x48, 0xff, 0xcb];
-const add_mem: [u8; 2] = [0x00, 0x0b];
-const sub_mem: [u8; 2] = [0x28, 0x0b];
-const out_mem: [u8; 3] = [0x41, 0xff, 0xd2];
-const in_mem:  [u8; 3] = [0x41, 0xff, 0xd3];
-const je:      [u8; 1] = [0xe9]; 
-const jne:     [u8; 2] = [0x0f, 0x85];
-const ret:     [u8; 1] = [0xc3];
+const INC_RDI: [u8; 3] = [0x48, 0xff, 0xc3];
+const DEC_RDI: [u8; 3] = [0x48, 0xff, 0xcb];
+const ADD_MEM: [u8; 2] = [0x00, 0x0b];
+const SUB_MEM: [u8; 2] = [0x28, 0x0b];
+const OUT_MEM: [u8; 3] = [0x41, 0xff, 0xd2];
+const IN_MEM:  [u8; 3] = [0x41, 0xff, 0xd3];
+const JE:      [u8; 1] = [0xe9]; 
+const JNE:     [u8; 2] = [0x0f, 0x85];
+const RET:     [u8; 1] = [0xc3];
 
 fn gen_je(addr: i32) -> [u8; 5] {
     let addr = (addr - 5) as u32;
@@ -60,7 +60,7 @@ fn gen_je(addr: i32) -> [u8; 5] {
     let b3 : u8 = ((addr >> 16) & 0xff) as u8;
     let b2 : u8 = ((addr >> 8) & 0xff) as u8;
     let b1 : u8 = (addr & 0xff) as u8;
-    [je[0], b1, b2, b3, b4]
+    [JE[0], b1, b2, b3, b4]
 }
 fn gen_jne(addr: i32) -> [u8; 6] {
     let addr = (addr - 6) as u32;
@@ -68,7 +68,7 @@ fn gen_jne(addr: i32) -> [u8; 6] {
     let b3 : u8 = ((addr >> 16) & 0xff) as u8;
     let b2 : u8 = ((addr >> 8) & 0xff) as u8;
     let b1 : u8 = (addr & 0xff) as u8;
-    [jne[0], jne[1], b1, b2, b3, b4]
+    [JNE[0], JNE[1], b1, b2, b3, b4]
 }
 
 fn gen_sub(addr: i64) -> [u8; 12] {
@@ -105,22 +105,29 @@ fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
     unsafe {
         let addr = mem as *const u8;
         let memaddr = addr as u64;
-        let addr = memaddr + (ptr as u64);
+        let memaddr = memaddr + (ptr as u64);
+
+        let addr = bf_read_fun as *const u8;
+        let bf_read_fun_addr = addr as u64;
+
+        let addr = bf_write_fun as *const u8;
+        let bf_write_fun_addr = addr as u64;
         
         let result_addr: u64;
-        asm!("mov $1, cl\n
-              mov %1, %r10\n
-              mov %2, %r11n
-              mov %3, %rbx\n
-              mov %4, %rax\n
-              call %rax\n
-              mov %rbx, %0" 
-              : "=r"(result_addr)
-              : "r" (bf_read_fun), 
-                "r" (bf_write_fun),
-                "r" (addr),
+        asm!("mov cl, 1
+              mov r10, $1
+              mov r11, $2
+              mov rbx, $3
+              mov rax, $4
+              call rax
+              mov $0, rbx" 
+              : "=&r"(result_addr)
+              : "r" (bf_read_fun_addr), 
+                "r" (bf_write_fun_addr),
+                "r" (memaddr),
                 "r" (jit)
-              : "rcx");
+              : "rcx", "rbx", "rax", "r10", "r11"
+              : "intel");
         
         result = (result_addr - memaddr) as usize;
     }
@@ -212,13 +219,16 @@ impl Op {
     fn compile(&self, pos: u32) -> Asm {
         let v = 
         match self {
-            Op::Next   => inc_rdi.to_vec(),
-            Op::Prev   => inc_rdi.to_vec(),
-            Op::Inc    => inc_rdi.to_vec(),
-            Op::Dec    => inc_rdi.to_vec(),
-            Op::Out    => inc_rdi.to_vec(),
-            Op::In     => inc_rdi.to_vec(),
-            Op::Sub(s) => inc_rdi.to_vec(),
+            Op::Next   => INC_RDI.to_vec(),
+            Op::Prev   => DEC_RDI.to_vec(),
+            Op::Inc    => ADD_MEM.to_vec(),
+            Op::Dec    => SUB_MEM.to_vec(),
+            Op::Out    => OUT_MEM.to_vec(),
+            Op::In     => IN_MEM.to_vec(),
+            Op::Sub(s) => {
+                let asm = s.compile(pos);
+                asm.ops
+            },
         };
         Asm::new(v)
     }
@@ -272,6 +282,13 @@ impl Env {
             let asm = sub.compile(0);
             let addr = self.mmap(asm);
             sub.machine_code = Some(addr);
+        }
+        match sub.machine_code {
+            Some(addr) => {
+                self.addr = enter_jit(&self.mem, self.addr, addr);
+                return Ok(());
+            },
+            None => ()
         }
         let mut pc = 0usize;
         loop {
