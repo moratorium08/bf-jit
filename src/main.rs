@@ -9,7 +9,7 @@ use std::vec;
 
 const MEMSIZE: usize = 600000;
 const INITIAL_MEM_ADDR: usize = 300000;
-const DEBUG: bool = true;
+const DEBUG: bool = false;
 const USE_JIT: bool = true;
 const THRESHOLD: u64 = 2;
 const PAGESIZE: usize = 4096;
@@ -134,10 +134,13 @@ fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
                 "r" (bf_write_fun_addr),
                 "r" (memaddr),
                 "r" (jit)
-              : "rcx", "rbx", "rax", "r10", "r11"
+              : "rcx", "rbx", "rax", "r10", "r11", "r10", "r11"
               : "intel");
         
         result = (result_addr - base_memaddr) as usize;
+        if DEBUG {
+            eprintln!("returned at: {}", result);
+        }
     }
     result
 }
@@ -212,7 +215,7 @@ impl Sub {
         Sub{ops: ops, count: 0, is_global, machine_code: None}
     }
 
-    fn compile(&self) -> Asm {
+    fn compile(&self, is_function: bool) -> Asm {
         let mut body = Asm::empty();
         for op in self.ops.iter() {
             let asm = op.compile();
@@ -228,7 +231,9 @@ impl Sub {
             let mut sub = Asm::empty();
             sub.push(Asm::new(gen_prologue(body.size()).to_vec()));
             sub.push(body);
-            sub.push(Asm::new(RET.to_vec()));
+            if is_function {
+                sub.push(Asm::new(RET.to_vec()));
+            }
             sub 
         }
     }
@@ -238,7 +243,7 @@ impl Sub {
             Some(_) => (),
             None => {
                 if USE_JIT && self.count > THRESHOLD {
-                    let asm = self.compile();
+                    let asm = self.compile(true);
                     let addr = mmap(asm);
                     self.machine_code = Some(addr);
                 }
@@ -287,7 +292,7 @@ impl Op {
                 match s.machine_code {
                     Some(addr) => gen_sub(addr).to_vec(),
                     None => {
-                        let asm = s.compile();
+                        let asm = s.compile(false);
                         asm.ops
                     }
                 }
@@ -314,6 +319,13 @@ impl Env {
         } else {
             size + PAGESIZE - (size % PAGESIZE)
         }
+    }
+
+    fn _dump(&self) {
+        for i in self.addr - 10..self.addr+10 {
+            print!("{} ", self.mem[i]);
+        }
+        println!();
     }
 
     fn run(&mut self, sub: &mut Sub, is_global: bool) -> Result<(), &str> {
@@ -379,11 +391,11 @@ fn main() -> io::Result<()> {
             let mut env = Env::new();
             match env.run(&mut ops, true) {
                 Ok(_) => (),
-                Err(s) => println!("{}", s)
+                Err(s) => eprintln!("execution error: {}", s)
             }
         },
         Err(reason) => {
-            println!("Failed to run: {}", reason);
+            eprintln!("parse error: {}", reason);
         }
     }
     Ok(())

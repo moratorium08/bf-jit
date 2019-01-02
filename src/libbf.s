@@ -10,11 +10,17 @@ bf_read_fun:
 	mov rsi, rbx
 	mov rdx, 1
 	syscall
+	test rax, rax
+	je exit
 	pop rcx
 	pop rbx
 	pop r11
 	pop r10
-    ret
+	ret
+exit:
+	mov rax, 60
+	mov rdi, 0
+	syscall
 .global bf_write_fun
 bf_write_fun:
 	push r10
@@ -30,4 +36,4 @@ bf_write_fun:
 	pop rbx
 	pop r11
 	pop r10
-    ret
+	ret
