@@ -1,7 +1,12 @@
 #![feature(asm)]
 #![feature(libc)]
+#[macro_use]
+extern crate clap;
 extern crate libc;
+#[macro_use]
+extern crate lazy_static;
 use libc::c_void;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::str::Chars;
@@ -12,7 +17,95 @@ const INITIAL_MEM_ADDR: usize = 300000;
 const DEBUG: bool = false;
 const USE_JIT: bool = true;
 const THRESHOLD: u64 = 2;
+const DEFAULT_FILENAME: &str = "a.bf";
 const PAGESIZE: usize = 4096;
+
+struct Param {
+    pub debug: bool,
+    pub use_jit: bool,
+    pub threshold: u64,
+    pub filename: String,
+}
+
+struct ParamBuilder {
+    debug_tmp: bool,
+    use_jit_tmp: bool,
+    threshold_tmp: u64,
+    filename_tmp: String
+}
+
+impl Param {
+    fn new(builder: ParamBuilder) -> Param {
+        Param{
+            debug: builder.debug_tmp,
+            use_jit: builder.use_jit_tmp,
+            threshold: builder.threshold_tmp,
+            filename: builder.filename_tmp,
+        }
+    }
+}
+
+impl ParamBuilder {
+    fn new() -> ParamBuilder {
+        ParamBuilder {
+            debug_tmp: DEBUG, 
+            use_jit_tmp: USE_JIT, 
+            threshold_tmp: THRESHOLD,
+            filename_tmp: String::from(DEFAULT_FILENAME)}
+    }
+    fn debug(self, debug_tmp: bool) -> ParamBuilder {
+        ParamBuilder{debug_tmp, ..self}
+    }
+    fn use_jit(self, use_jit_tmp: bool) -> ParamBuilder {
+        ParamBuilder{use_jit_tmp, ..self}
+    }
+    fn threshold(self, threshold_tmp: u64) -> ParamBuilder {
+        ParamBuilder{threshold_tmp, ..self}
+    }
+    fn filename(self, filename_tmp: String) -> ParamBuilder {
+        ParamBuilder{filename_tmp, ..self}
+    }
+    fn build(self) -> Param {
+        Param::new(self)
+    }
+}
+
+lazy_static! {
+    static ref PARAM: Param =  {
+        let argparse = clap::App::new("bf-jit")
+                            .version("1.0")
+                            .author("moratorium08")
+                            .arg(clap::Arg::with_name("filename")
+                                        .help("input file to run")
+                                        .index(1)
+                                        .required(true))
+                            .arg(clap::Arg::with_name("debug")
+                                        .help("debug mode")
+                                        .long("debug")
+                                        )
+                            .arg(clap::Arg::with_name("no-jit")
+                                        .help("jit mode")
+                                        .long("no-jit")
+                                        )
+                            .arg(clap::Arg::with_name("threshold")
+                                        .help("jit compile threshold")
+                                        .long("threshold")
+                                        .short("t")
+                                        )
+                            .get_matches();
+        
+        let filename = argparse.value_of("filename").unwrap_or(DEFAULT_FILENAME);
+        let debug = argparse.is_present("debug");
+        let jit_mode = !argparse.is_present("no-jit");
+        let threshold = value_t!(argparse, "threshold", u64).unwrap_or(THRESHOLD);
+        ParamBuilder::new()
+            .debug(debug)
+            .use_jit(jit_mode)
+            .threshold(threshold)
+            .filename(String::from(filename))
+            .build()
+    };
+}
 
 /* JITの構造 
 * Machine Codeモードではcl = 1であることを仮定、現在のメモリ位置をrbxで取ることを仮定
@@ -138,7 +231,7 @@ fn enter_jit(mem: &[u8; MEMSIZE], ptr: usize, jit: u64) -> usize {
               : "intel");
         
         result = (result_addr - base_memaddr) as usize;
-        if DEBUG {
+        if PARAM.debug {
             eprintln!("returned at: {}", result);
         }
     }
@@ -242,7 +335,7 @@ impl Sub {
         match self.machine_code {
             Some(_) => (),
             None => {
-                if USE_JIT && self.count > THRESHOLD {
+                if PARAM.use_jit && self.count > PARAM.threshold {
                     let asm = self.compile(true);
                     let addr = mmap(asm);
                     self.machine_code = Some(addr);
@@ -385,7 +478,9 @@ impl Env {
 
 fn main() -> io::Result<()> {
     let mut buffer = String::new();
-    io::stdin().read_to_string(&mut buffer)?;
+    let mut file = fs::File::open(&PARAM.filename)?;
+    file.read_to_string(&mut buffer)?;
+
     match Op::parse(&mut buffer.chars(), true) {
         Ok(mut ops) => {
             let mut env = Env::new();
